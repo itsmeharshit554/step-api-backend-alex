@@ -6,6 +6,7 @@ Handles reading, analysis, and extraction of data from STEP files
 import logging
 from typing import Dict, Any, List, Tuple
 import os
+import math
 
 try:
     from OCC.Core.STEPControl import STEPControl_Reader
@@ -312,8 +313,74 @@ class STEPProcessor:
         return {"OD": 2 * r, "ID": None, "thickness": None}
 
 
+    
+    def extract_cylinder_length(self, shape: TopoDS_Shape, round_to: int = 3) -> float:
+        """
+        Estimate cylinder length by projecting bounding box along cylinder axis.
+        Works for bush / rod type parts.
+        """
 
+        cylinders = self.extract_cylinders(shape, round_to=6)
+        if not cylinders:
+            return None
 
+        # Take dominant cylinder (largest radius)
+        cyl = max(cylinders, key=lambda c: c["radius"])
+
+        # Axis direction
+        dx, dy, dz = cyl["axis_dir"]
+        axis_len = math.sqrt(dx*dx + dy*dy + dz*dz)
+        ux, uy, uz = dx/axis_len, dy/axis_len, dz/axis_len
+
+        # Bounding box
+        bbox = Bnd_Box()
+        brepbndlib_Add(shape, bbox)
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+
+        corners = [
+            (xmin, ymin, zmin), (xmin, ymin, zmax),
+            (xmin, ymax, zmin), (xmin, ymax, zmax),
+            (xmax, ymin, zmin), (xmax, ymin, zmax),
+            (xmax, ymax, zmin), (xmax, ymax, zmax),
+        ]
+
+        projections = [
+            x*ux + y*uy + z*uz for x, y, z in corners
+        ]
+
+        length = max(projections) - min(projections)
+        return round(length, round_to)
+
+    
+    def extract_weight(self, shape: TopoDS_Shape, density: float, round_to: int = 3) -> float:
+        """
+        Compute weight from STEP volume and provided density.
+
+        density:
+            kg/mm3  → if STEP is in mm
+            kg/m3   → if STEP is in meters
+        """
+
+        props = GProp_GProps()
+        brepgprop_VolumeProperties(shape, props)
+        volume = props.Mass()
+
+        weight = volume * density
+        return round(weight, round_to)
+
+    
+    def extract_length_and_weight(
+        self,
+        file_path: str,
+        density: float
+    ) -> Dict[str, Any]:
+
+        shape, _ = self._read_step_file(file_path)
+
+        return {
+            "length": self.extract_cylinder_length(shape),
+            "weight": self.extract_weight(shape, density),
+        }
 
     
     def _extract_topology_info(self, shape: TopoDS_Shape) -> Dict[str, Any]:
