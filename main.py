@@ -12,17 +12,17 @@ from OCP.IFSelect import IFSelect_RetDone
 
 from OCP.Bnd import Bnd_Box
 from OCP.BRepBndLib import BRepBndLib            # static methods have _s suffix in OCP
-
 from OCP.BRepGProp import BRepGProp              # static methods have _s suffix in OCP
 from OCP.GProp import GProp_GProps
 
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopAbs import TopAbs_SOLID, TopAbs_FACE
+# ✅ CHANGED: add COMPSOLID + SHELL
+from OCP.TopAbs import TopAbs_SOLID, TopAbs_COMPSOLID, TopAbs_SHELL, TopAbs_FACE
 
 from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.GeomAbs import GeomAbs_Cylinder
 
-app = FastAPI(title="STEP Geometry API", version="2.0")
+app = FastAPI(title="STEP Geometry API", version="2.1")
 
 
 # --------------------------
@@ -66,18 +66,80 @@ def compute_geom(shape) -> Tuple[float, float]:
 # --------------------------
 # Topology iteration helpers
 # --------------------------
-def iter_solids(shape):
-    exp = TopExp_Explorer(shape, TopAbs_SOLID)
-    while exp.More():
-        yield exp.Current()
-        exp.Next()
-
-
 def iter_faces(shape):
     exp = TopExp_Explorer(shape, TopAbs_FACE)
     while exp.More():
         yield exp.Current()
         exp.Next()
+
+
+# ✅ ADDED: robust body iterator (SOLID -> COMPSOLID -> SHELL -> fallback to shape)
+def iter_bodies(shape):
+    """
+    Robust body iterator:
+    - SOLID first
+    - then COMPSOLID
+    - then SHELL
+    - else whole shape
+    """
+    solids: List[Any] = []
+    exp = TopExp_Explorer(shape, TopAbs_SOLID)
+    while exp.More():
+        solids.append(exp.Current())
+        exp.Next()
+    if solids:
+        for s in solids:
+            yield ("solid", s)
+        return
+
+    comps: List[Any] = []
+    exp = TopExp_Explorer(shape, TopAbs_COMPSOLID)
+    while exp.More():
+        comps.append(exp.Current())
+        exp.Next()
+    if comps:
+        for c in comps:
+            yield ("compsolid", c)
+        return
+
+    shells: List[Any] = []
+    exp = TopExp_Explorer(shape, TopAbs_SHELL)
+    while exp.More():
+        shells.append(exp.Current())
+        exp.Next()
+    if shells:
+        for sh in shells:
+            yield ("shell", sh)
+        return
+
+    yield ("shape", shape)
+
+
+# ✅ ADDED: debug topology counts (so you see why core/sleeve were null)
+def count_topology(shape) -> Dict[str, int]:
+    counts = {"solids": 0, "compsolids": 0, "shells": 0, "faces": 0}
+
+    exp = TopExp_Explorer(shape, TopAbs_SOLID)
+    while exp.More():
+        counts["solids"] += 1
+        exp.Next()
+
+    exp = TopExp_Explorer(shape, TopAbs_COMPSOLID)
+    while exp.More():
+        counts["compsolids"] += 1
+        exp.Next()
+
+    exp = TopExp_Explorer(shape, TopAbs_SHELL)
+    while exp.More():
+        counts["shells"] += 1
+        exp.Next()
+
+    exp = TopExp_Explorer(shape, TopAbs_FACE)
+    while exp.More():
+        counts["faces"] += 1
+        exp.Next()
+
+    return counts
 
 
 # --------------------------
@@ -120,7 +182,7 @@ def od_id_thickness_from_radii(radii: List[float]) -> Dict[str, Optional[float]]
 
 
 def solid_length_mm(solid) -> float:
-    """Use solid bbox max dimension as length estimate (works well for bush parts)."""
+    """Use bbox max dimension as length estimate (works well for bush parts)."""
     bb = compute_bbox(solid)
     return float(max(bb["length_mm"], bb["width_mm"], bb["height_mm"]))
 
@@ -131,42 +193,52 @@ def solid_volume_mm3(solid) -> float:
     return float(props.Mass())
 
 
+# ✅ CHANGED: uses iter_bodies() + handles shell/shape (volume may be unavailable)
 def compute_core_sleeve(shape,
                         density_core_kg_per_mm3: Optional[float] = None,
                         density_sleeve_kg_per_mm3: Optional[float] = None) -> Dict[str, Any]:
     """
     Returns:
       { "core": {...}, "sleeve": {...}, "extra_solids": [...] }
-    If multiple solids map to same role, keeps the largest by volume and pushes others to extra_solids.
+    Works even when STEP has no TopAbs_SOLID (e.g. only shells/compounds).
     """
     per_role: Dict[str, Any] = {}
     extra_solids: List[Dict[str, Any]] = []
 
-    for solid in iter_solids(shape):
-        role = classify_solid(solid)
-        radii = extract_cylinder_radii(solid, round_to=6)
+    for body_type, body in iter_bodies(shape):
+        role = classify_solid(body)
+        radii = extract_cylinder_radii(body, round_to=6)
         dims = od_id_thickness_from_radii(radii)
-        length = solid_length_mm(solid)
-        vol = solid_volume_mm3(solid)
+        length = solid_length_mm(body)
+
+        # volume is reliable for solid/compsolid; shell/shape may be open => skip volume
+        vol: Optional[float] = None
+        if body_type in ("solid", "compsolid"):
+            vol = solid_volume_mm3(body)
 
         density = density_core_kg_per_mm3 if role == "core" else density_sleeve_kg_per_mm3
-        weight_kg = (vol * density) if density is not None else None
+        weight_kg = (vol * density) if (vol is not None and density is not None) else None
 
         payload = {
             "role": role,
+            "body_type": body_type,          # "solid" | "compsolid" | "shell" | "shape"
             "length_mm": length,
             **dims,
-            "cylinder_radii_mm": radii,  # debug/trace
-            "volume": {"mm3": vol, "m3": vol * 1e-9},
+            "cylinder_radii_mm": radii,      # debug/trace
+            "volume": ({"mm3": vol, "m3": vol * 1e-9} if vol is not None else None),
             "weight_kg": weight_kg,
-            "weight_requires_density": density is None
+            "weight_requires_density": density is None,
+            "volume_available": vol is not None
         }
 
         if role not in per_role:
             per_role[role] = payload
         else:
-            # keep the larger solid for that role
-            if vol > per_role[role]["volume"]["mm3"]:
+            # keep the one with larger volume if volume is available; else keep first
+            existing_vol = per_role[role]["volume"]["mm3"] if per_role[role]["volume"] else -1
+            this_vol = vol if vol is not None else -1
+
+            if this_vol > existing_vol:
                 extra_solids.append(per_role[role])
                 per_role[role] = payload
             else:
@@ -211,6 +283,9 @@ async def analyze(
         bbox = compute_bbox(shape)
         vol_mm3, area_mm2 = compute_geom(shape)
 
+        # ✅ ADDED: diagnostics
+        topo_counts = count_topology(shape)
+
         core_sleeve = compute_core_sleeve(
             shape,
             density_core_kg_per_mm3=density_core_kg_per_mm3,
@@ -219,6 +294,7 @@ async def analyze(
 
         return JSONResponse({
             "file": file.filename,
+            "topology_counts": topo_counts,  # ✅ ADDED
             "bounding_box_mm": bbox,
             "solid_volume": {"mm3": vol_mm3, "m3": vol_mm3 * 1e-9},
             "surface_area": {"mm2": area_mm2, "m2": area_mm2 * 1e-6},
@@ -274,6 +350,9 @@ def analyze_base64(
         bbox = compute_bbox(shape)
         vol_mm3, area_mm2 = compute_geom(shape)
 
+        # ✅ ADDED: diagnostics
+        topo_counts = count_topology(shape)
+
         core_sleeve = compute_core_sleeve(
             shape,
             density_core_kg_per_mm3=density_core_kg_per_mm3,
@@ -282,6 +361,7 @@ def analyze_base64(
 
         return {
             "file": filename,
+            "topology_counts": topo_counts,  # ✅ ADDED
             "bounding_box_mm": bbox,
             "solid_volume": {"mm3": vol_mm3, "m3": vol_mm3 * 1e-9},
             "surface_area": {"mm2": area_mm2, "m2": area_mm2 * 1e-6},
