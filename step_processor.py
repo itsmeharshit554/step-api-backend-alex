@@ -21,8 +21,13 @@ try:
         brepgprop_SurfaceProperties,
         brepgprop_LinearProperties
     )
+    
+    from typing import Dict, Any, List, Tuple, Set
+
     from OCC.Core.Bnd import Bnd_Box
+    from OCC.Core.GeomAbs import GeomAbs_Cylinder
     from OCC.Core.BRepBndLib import brepbndlib_Add
+    from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
     from OCC.Core.BRepCheck import BRepCheck_Analyzer
     from OCC.Core.TopoDS import TopoDS_Shape, TopoDS_Compound
     from OCC.Core.TopTools import TopTools_IndexedMapOfShape
@@ -143,6 +148,68 @@ class STEPProcessor:
         
         return shape, metadata
     
+    
+    def extract_cylinder_radii(self, shape: TopoDS_Shape, round_to: int = 6) -> List[float]:
+        
+        """
+        Return unique cylinder radii found on cylindrical faces of the given shape/solid.
+        Radii are returned sorted ascending.
+        """
+        radii: Set[float] = set()
+
+        exp = TopExp_Explorer(shape, TopAbs_FACE)
+        while exp.More():
+            face = exp.Current()
+            exp.Next()
+
+            adaptor = BRepAdaptor_Surface(face)
+            if adaptor.GetType() == GeomAbs_Cylinder:
+                r = float(adaptor.Cylinder().Radius())
+                radii.add(round(r, round_to))
+
+        return sorted(radii)
+
+
+    # -----------------------------
+    # 2) Extract cylinders (richer output: radius + axis)
+    # -----------------------------
+    def extract_cylinders(self, shape: TopoDS_Shape, round_to: int = 6) -> List[Dict[str, Any]]:
+        """
+        Returns cylinder features: radius + axis direction + axis location.
+        Useful if you later want coaxial grouping.
+        """
+        out: List[Dict[str, Any]] = []
+
+        exp = TopExp_Explorer(shape, TopAbs_FACE)
+        while exp.More():
+            face = exp.Current()
+            exp.Next()
+
+            adaptor = BRepAdaptor_Surface(face)
+            if adaptor.GetType() == GeomAbs_Cylinder: 
+                cyl = adaptor.Cylinder()
+                ax = cyl.Axis()
+                loc = ax.Location()
+                direc = ax.Direction()
+
+                out.append({
+                    "radius": round(float(cyl.Radius()), round_to),
+                    "axis_dir": (
+                        round(float(direc.X()), round_to),
+                        round(float(direc.Y()), round_to),
+                        round(float(direc.Z()), round_to),
+                    ),
+                    "axis_loc": (
+                        round(float(loc.X()), round_to),
+                        round(float(loc.Y()), round_to),
+                        round(float(loc.Z()), round_to),
+                    ),
+                })
+
+        return out
+
+
+
     def _extract_geometric_properties(self, shape: TopoDS_Shape) -> Dict[str, Any]:
         """
         Extract geometric properties (volume, surface area, bounding box)
@@ -191,10 +258,12 @@ class STEPProcessor:
         
         # Bounding box
         try:
-            bbox = Bnd_Box()
-            brepbndlib_Add(shape, bbox)
             
+            bbox = Bnd_Box()
+            bbox.SetGap(0.0)
+            brepbndlib_Add(shape, bbox)
             xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+
             
             properties["bounding_box"] = {
                 "min": {"x": xmin, "y": ymin, "z": zmin},
@@ -211,17 +280,54 @@ class STEPProcessor:
         
         return properties
     
+    
+    def _classify_solid(self, solid: TopoDS_Shape) -> str:
+        
+        """
+        Classify solid as 'core' or 'sleeve' based on number of unique cylinder radii.
+
+        Rule (for bush-like parts):
+          - sleeve (hollow) typically has 2 radii (ID + OD)
+          - core (solid rod) typically has 1 radius
+        """
+        radii = self.extract_cylinder_radii(solid, round_to=6)
+        return "sleeve" if len(radii) >= 2 else "core"
+
+    
+    
+    def extract_od_id_thickness(self, radii: List[float]) -> Dict[str, Any]:
+        if not radii:
+            return {"OD": None, "ID": None, "thickness": None}
+
+        if len(radii) >= 2:
+            r_in = min(radii)
+            r_out = max(radii)
+            return {
+                "OD": 2 * r_out,
+                "ID": 2 * r_in,
+                "thickness": r_out - r_in
+            }
+
+        r = radii[0]
+        return {"OD": 2 * r, "ID": None, "thickness": None}
+
+
+
+
+
+    
     def _extract_topology_info(self, shape: TopoDS_Shape) -> Dict[str, Any]:
+        
         """
         Extract topology information (counts of solids, faces, edges, vertices)
-        
+
         Args:
             shape: TopoDS_Shape to analyze
-            
+
         Returns:
             Dictionary with topology counts
         """
-        topology = {
+        topology: Dict[str, Any] = {
             "solids": 0,
             "compounds": 0,
             "shells": 0,
@@ -229,76 +335,99 @@ class STEPProcessor:
             "edges": 0,
             "vertices": 0
         }
-        
-        # Count topology elements
+
+        # Count topology elements (GLOBAL)
         explorer = TopologyExplorer(shape)
-        
+
         topology["solids"] = explorer.number_of_solids()
         topology["compounds"] = explorer.number_of_compounds()
         topology["shells"] = explorer.number_of_shells()
         topology["faces"] = explorer.number_of_faces()
         topology["edges"] = explorer.number_of_edges()
         topology["vertices"] = explorer.number_of_vertices()
+
         
-        # Additional details
+        radii = self.extract_cylinder_radii(solid, round_to=6)
+        dims = self.extract_od_id_thickness(radii)
+
+        # NEW: per-solid topology + role
+        topology["per_solid"] = []
+        for solid in explorer.solids():
+            solid_explorer = TopologyExplorer(solid)
+            role = self._classify_solid(solid)
+
+            
+        topology["per_solid"].append({
+            "role": role,
+            "faces": solid_explorer.number_of_faces(),
+            "edges": solid_explorer.number_of_edges(),
+            "vertices": solid_explorer.number_of_vertices(),
+            "cylinder_radii": radii,
+            "dimensions_hint": dims
+        })
+
+
+        # Additional details (same as your logic)
         topology["details"] = {
             "has_free_edges": len(list(explorer.edges())) != topology["edges"],
             "shape_type": shape.ShapeType()
         }
-        
+
         return topology
+
+
     
     def _validate_shape(self, shape: TopoDS_Shape) -> Dict[str, Any]:
-        """
-        Validate shape quality and check for issues
-        
-        Args:
-            shape: TopoDS_Shape to validate
-            
-        Returns:
-            Dictionary with validation results
-        """
         validation = {
             "is_valid": False,
             "is_done": False,
             "issues": []
         }
-        
+
         try:
             analyzer = BRepCheck_Analyzer(shape)
             validation["is_valid"] = analyzer.IsValid()
-            
+
             if not validation["is_valid"]:
-                # The shape has issues
                 validation["issues"].append("Shape contains geometric or topological errors")
-            
+
             validation["is_done"] = True
-            
+
         except Exception as e:
             logger.error(f"Validation error: {e}")
             validation["issues"].append(f"Validation failed: {str(e)}")
-        
-        # Additional quality checks
+
+        # ---- Per-solid validation ----
+        validation["per_solid"] = []
         try:
             explorer = TopologyExplorer(shape)
-            
-            # Check for degenerate edges
-            degenerate_count = 0
-            for edge in explorer.edges():
-                if edge.Degenerated():
-                    degenerate_count += 1
-            
+            for solid in explorer.solids():
+                role = self._classify_solid(solid)
+                solid_analyzer = BRepCheck_Analyzer(solid)
+
+                validation["per_solid"].append({
+                    "role": role,
+                    "is_valid": solid_analyzer.IsValid()
+                })
+        except Exception as e:
+            logger.warning(f"Per-solid validation error: {e}")
+
+        # ---- Degenerate edges ----
+        try:
+            explorer = TopologyExplorer(shape)
+            degenerate_count = sum(1 for e in explorer.edges() if e.Degenerated())
+
             if degenerate_count > 0:
                 validation["issues"].append(f"Found {degenerate_count} degenerate edges")
-            
+
             validation["quality_metrics"] = {
                 "degenerate_edges": degenerate_count,
                 "total_edges": explorer.number_of_edges()
             }
-            
+
         except Exception as e:
             logger.warning(f"Quality check error: {e}")
-        
+
         return validation
     
     def _extract_assembly_structure(self, file_path: str) -> Dict[str, Any]:
@@ -311,12 +440,15 @@ class STEPProcessor:
         Returns:
             Dictionary with assembly information
         """
+        
         assembly_info = {
             "is_assembly": False,
+            "part_count": 0,
             "parts": [],
             "layers": [],
             "colors": []
         }
+
         
         try:
             # Create XCAF document
