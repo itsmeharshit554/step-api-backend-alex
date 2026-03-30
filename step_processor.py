@@ -88,7 +88,8 @@ class STEPProcessor:
             "geometry": self._extract_geometric_properties(shape),
             "topology": self._extract_topology_info(shape),
             "validation": self._validate_shape(shape),
-            "assembly": self._extract_assembly_structure(file_path)
+            "assembly": self._extract_assembly_structure(file_path),
+            "parts_dimensions": self.extract_all_part_dimensions(shape)
         }
         
         return result
@@ -143,6 +144,54 @@ class STEPProcessor:
         
         return shape, metadata
     
+
+    def extract_cylinder_radii(self, shape: TopoDS_Shape) -> List[float]:
+        from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
+        from OCC.Core.GeomAbs import GeomAbs_Cylinder
+
+        radii = set()
+
+        exp = TopExp_Explorer(shape, TopAbs_FACE)
+        while exp.More():
+            face = exp.Current()
+            exp.Next()
+
+            adaptor = BRepAdaptor_Surface(face)
+            if adaptor.GetType() == GeomAbs_Cylinder:
+                r = adaptor.Cylinder().Radius()
+                radii.add(round(float(r), 5))
+
+        return sorted(list(radii))
+    def extract_od_id_thickness(self, radii: List[float]) -> Dict[str, Any]:
+        if not radii:
+            return {"OD": None, "ID": None, "thickness": None}
+
+        if len(radii) >= 2:
+            r_in = min(radii)
+            r_out = max(radii)
+            return {
+                "OD": 2 * r_out,
+                "ID": 2 * r_in,
+                "thickness": r_out - r_in
+            }
+
+        r = radii[0]
+        return {"OD": 2 * r, "ID": None, "thickness": None}
+
+    def extract_length(self, shape: TopoDS_Shape) -> float:
+        try:
+            bbox = Bnd_Box()
+            brepbndlib_Add(shape, bbox)
+            xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+
+            dx = xmax - xmin
+            dy = ymax - ymin
+            dz = zmax - zmin
+
+            return round(max(dx, dy, dz), 3)
+        except:
+            return None
+
     def _extract_geometric_properties(self, shape: TopoDS_Shape) -> Dict[str, Any]:
         """
         Extract geometric properties (volume, surface area, bounding box)
@@ -210,7 +259,40 @@ class STEPProcessor:
             properties["bounding_box"] = None
         
         return properties
-    
+    def extract_all_part_dimensions(self, shape: TopoDS_Shape) -> List[Dict[str, Any]]:
+        """
+        Extract length, OD, ID, thickness, volume for each solid
+        """
+
+        solids_data = []
+        explorer = TopologyExplorer(shape)
+
+        for idx, solid in enumerate(explorer.solids(), start=1):
+
+            radii = self.extract_cylinder_radii(solid)
+            dims = self.extract_od_id_thickness(radii)
+            length = self.extract_length(solid)
+
+            # Volume
+            volume = None
+            try:
+                props = GProp_GProps()
+                brepgprop_VolumeProperties(solid, props)
+                volume = props.Mass()
+            except:
+                pass
+
+            solids_data.append({
+                "part_index": idx,
+                "OD": dims["OD"],
+                "ID": dims["ID"],
+                "thickness": dims["thickness"],
+                "length": length,
+                "volume": volume,
+                "radii": radii
+            })
+
+        return solids_data
     def _extract_topology_info(self, shape: TopoDS_Shape) -> Dict[str, Any]:
         """
         Extract topology information (counts of solids, faces, edges, vertices)

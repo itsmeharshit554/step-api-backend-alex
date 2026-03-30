@@ -21,6 +21,90 @@ app = FastAPI(title="STEP Geometry API", version="1.2")
 # --------------------------
 # Core OCCT helper routines
 # --------------------------
+
+from OCP.TopExp import TopExp_Explorer
+from OCP.TopAbs import TopAbs_FACE
+from OCP.BRepAdaptor import BRepAdaptor_Surface
+from OCP.GeomAbs import GeomAbs_Cylinder
+
+def extract_cylinder_radii(shape):
+    radii = set()
+
+    exp = TopExp_Explorer(shape, TopAbs_FACE)
+    while exp.More():
+        face = exp.Current()
+        exp.Next()
+
+        adaptor = BRepAdaptor_Surface(face)
+        if adaptor.GetType() == GeomAbs_Cylinder:
+            r = adaptor.Cylinder().Radius()
+            radii.add(round(float(r), 5))
+
+    return sorted(list(radii))
+
+def extract_od_id_thickness(radii):
+    if not radii:
+        return {"OD": None, "ID": None, "thickness": None}
+
+    if len(radii) >= 2:
+        r_in = min(radii)
+        r_out = max(radii)
+        return {
+            "OD": 2 * r_out,
+            "ID": 2 * r_in,
+            "thickness": r_out - r_in
+        }
+
+    r = radii[0]
+    return {"OD": 2 * r, "ID": None, "thickness": None}
+
+
+from OCP.TopAbs import TopAbs_SOLID
+
+def extract_parts(shape):
+    parts = []
+
+    exp = TopExp_Explorer(shape, TopAbs_SOLID)
+    idx = 1
+
+    while exp.More():
+        solid = exp.Current()
+        exp.Next()
+
+        # Bounding box → length
+        bbox = Bnd_Box()
+        bbox.SetGap(0.0)
+        BRepBndLib.Add_s(solid, bbox, True)
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+
+        dx = xmax - xmin
+        dy = ymax - ymin
+        dz = zmax - zmin
+        length = round(max(dx, dy, dz), 3)
+
+        # Volume
+        props = GProp_GProps()
+        BRepGProp.VolumeProperties_s(solid, props)
+        volume = props.Mass()
+
+        # Radii + dims
+        radii = extract_cylinder_radii(solid)
+        dims = extract_od_id_thickness(radii)
+
+        parts.append({
+            "part_index": idx,
+            "OD_mm": dims["OD"],
+            "ID_mm": dims["ID"],
+            "thickness_mm": dims["thickness"],
+            "length_mm": length,
+            "volume_mm3": volume,
+            "radii": radii
+        })
+
+        idx += 1
+
+    return parts
+
 def read_step_shape(path: str):
     """Read a STEP file and return a TopoDS_Shape."""
     reader = STEPControl_Reader()
@@ -135,12 +219,14 @@ async def analyze(file: UploadFile = File(...)):
         shape = read_step_shape(tmp_path)
         bbox = compute_bbox(shape)
         vol_mm3, area_mm2 = compute_geom(shape)
+        parts = extract_parts(shape)
 
         return JSONResponse({
             "file": file.filename,
             "bounding_box_mm": bbox,
             "solid_volume": {"mm3": vol_mm3, "m3": vol_mm3 * 1e-9},
             "surface_area": {"mm2": area_mm2, "m2": area_mm2 * 1e-6},
+            "parts": parts,
             "units": {"length": "mm", "area": "mm2/m2", "volume": "mm3/m3"}
         })
 
@@ -176,8 +262,9 @@ def analyze_base64(req: AnalyzeBase64Request):
         shape = read_step_shape(tmp_path)  # IFSelect_RetDone must be returned for success [1](https://www.desmos.com/api/geometry)
         bbox = compute_bbox(shape)
         vol_mm3, area_mm2 = compute_geom(shape)
-
+        parts = extract_parts(shape)
         return {
+            "parts": parts,
             "file": req.filename,
             "bounding_box_mm": bbox,
             "solid_volume": {"mm3": vol_mm3, "m3": vol_mm3 * 1e-9},
