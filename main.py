@@ -1,139 +1,110 @@
-"""
-STEP File Analysis API
-FastAPI backend for processing STEP files and extracting geometric and topology data
-"""
-
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+# main.py
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import tempfile
 import os
-from typing import Dict, Any
-import logging
+import base64
+import binascii
 
-from .step_processor import STEPProcessor
+# ---- OpenCascade via OCP (cadquery-ocp) ----
+from OCP.STEPControl import STEPControl_Reader
+from OCP.IFSelect import IFSelect_RetDone
+from OCP.Bnd import Bnd_Box
+from OCP.BRepBndLib import BRepBndLib
+from OCP.BRepGProp import BRepGProp
+from OCP.GProp import GProp_GProps
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Initialize FastAPI app
-app = FastAPI(
-    title="STEP File Analysis API",
-    description="API for analyzing STEP files and extracting geometric, topology, and metadata",
-    version="1.0.0"
-)
-
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize STEP processor
-processor = STEPProcessor()
+app = FastAPI(title="STEP Geometry API", version="1.2")
 
 
-def _normalize_density_to_kg_per_mm3(d: Optional[float]) -> Optional[float]:
-    """
-    Accept density in:
-      - kg/mm3  (steel: 7.85e-6, aluminum: 2.70e-6)
-      - OR g/mm3 (common user input: aluminum 0.00270, steel 0.00785)
-    Rule: if d > 1e-4 assume g/mm3 -> convert to kg/mm3 by /1000
-    """
-    if d is None:
-        return None
-    d = float(d)
-    if d > 1e-4:
-        return d / 1000.0
-    return d
+# --------------------------
+# Core OCCT helper routines
+# --------------------------
+def read_step_shape(path: str):
+    """Read a STEP file and return a TopoDS_Shape."""
+    reader = STEPControl_Reader()
+    status = reader.ReadFile(path)  # must return IFSelect_RetDone for success [1](https://www.desmos.com/api/geometry)
+    if status != IFSelect_RetDone:
+        raise ValueError("Failed to read STEP file (IFSelect_RetDone not returned).")
+    if not reader.TransferRoots():
+        raise ValueError("STEP transfer failed.")
+    return reader.OneShape()
 
 
-def _solid_volume_mm3(solid) -> float:
-    props = GProp_GProps()
-    brepgprop_VolumeProperties(solid, props)
-    return float(props.Mass())
-
-
-def _assign_outer_core_rubber(per_solid: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Deterministic 3-part assignment:
-      1) outer_sleeve: candidate with (>=2 radii) and max OD
-      2) core: remaining with smallest OD among those with OD
-      3) rubber: remaining with max volume
-    """
-    # sleeve candidates: >=2 cylinder radii and OD available
-    sleeve_candidates = [s for s in per_solid if s.get("OD_mm") is not None and len(s.get("cylinder_radii_mm", [])) >= 2]
-    outer = max(sleeve_candidates, key=lambda x: x["OD_mm"]) if sleeve_candidates else None
-
-    remaining = [s for s in per_solid if s is not outer]
-
-    # core candidates: OD available
-    core_candidates = [s for s in remaining if s.get("OD_mm") is not None]
-    core = min(core_candidates, key=lambda x: x["OD_mm"]) if core_candidates else None
-
-    remaining2 = [s for s in remaining if s is not core]
-
-    # rubber: max volume among remaining
-    rubber = max(remaining2, key=lambda x: x.get("volume_mm3", -1)) if remaining2 else None
-
-    extras = [s for s in per_solid if s not in (outer, core, rubber)]
-
-    return {"outer_sleeve": outer, "core": core, "rubber": rubber, "extra_solids": extras}
-
-
-def _analyze_shape_with_components(shape, d_outer, d_core, d_rubber) -> Dict[str, Any]:
-    """
-    Builds per-solid + components mapping with length & weight.
-    """
-    topo = TopologyExplorer(shape)
-    solids = list(topo.solids())
-
-    per_solid: List[Dict[str, Any]] = []
-
-    for idx, solid in enumerate(solids, start=1):
-        radii = processor.extract_cylinder_radii(solid, round_to=6)
-        dims = processor.extract_od_id_thickness(radii)  # returns OD, ID, thickness (in same units as STEP)
-        length = processor.extract_cylinder_length(solid)  # ✅ you added this
-        vol_mm3 = _solid_volume_mm3(solid)
-
-        per_solid.append({
-            "index": idx,
-            "cylinder_radii_mm": radii,
-            "OD_mm": float(dims["OD"]) if dims.get("OD") is not None else None,
-            "ID_mm": float(dims["ID"]) if dims.get("ID") is not None else None,
-            "thickness_mm": float(dims["thickness"]) if dims.get("thickness") is not None else None,
-            "length_mm": length,
-            "volume_mm3": vol_mm3
-        })
-
-    # Assign 3 components
-    comp = _assign_outer_core_rubber(per_solid)
-
-    # Attach weight using per-component density (kg/mm3)
-    def attach_weight(part: Optional[Dict[str, Any]], dens: Optional[float]) -> Optional[Dict[str, Any]]:
-        if part is None:
-            return None
-        if dens is None:
-            part["weight_kg"] = None
-            part["weight_requires_density"] = True
-            return part
-        part["weight_kg"] = float(part["volume_mm3"]) * dens
-        part["weight_requires_density"] = False
-        return part
-
-    comp["outer_sleeve"] = attach_weight(comp["outer_sleeve"], d_outer)
-    comp["core"] = attach_weight(comp["core"], d_core)
-    comp["rubber"] = attach_weight(comp["rubber"], d_rubber)
-
+def compute_bbox(shape):
+    bbox = Bnd_Box()
+    bbox.SetGap(0.0)
+    BRepBndLib.Add_s(shape, bbox, True)
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
     return {
-        "status": "healthy",
-        "service": "STEP File Analysis API",
-        "version": "1.0.0"
+        "xmin": xmin, "ymin": ymin, "zmin": zmin,
+        "xmax": xmax, "ymax": ymax, "zmax": zmax,
+        "length_mm": xmax - xmin,
+        "width_mm":  ymax - ymin,
+        "height_mm": zmax - zmin
     }
+
+
+def compute_geom(shape):
+    vol_props = GProp_GProps()
+    area_props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shape, vol_props)
+    BRepGProp.SurfaceProperties_s(shape, area_props)
+    return vol_props.Mass(), area_props.Mass()
+
+
+# --------------------------
+# Request model (Swagger will show correct fields)
+# --------------------------
+class AnalyzeBase64Request(BaseModel):
+    filename: str
+    content_b64: str
+
+
+# --------------------------
+# Base64 utilities (handles PA + Swagger)
+# --------------------------
+def normalize_b64(b64: str) -> str:
+    s = b64.strip()
+
+    # If someone sends data URI, strip prefix:
+    # data:application/octet-stream;base64,AAA...
+    if s.lower().startswith("data:") and "," in s:
+        s = s.split(",", 1)[1]
+
+    # remove whitespace/newlines
+    s = "".join(s.split())
+
+    # fix padding
+    pad = len(s) % 4
+    if pad != 0:
+        s += "=" * (4 - pad)
+
+    return s
+
+
+def decode_b64(b64: str) -> bytes:
+    s = normalize_b64(b64)
+    try:
+        return base64.b64decode(s, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"content_b64 is not valid base64: {str(e)}"
+        )
+
+
+def assert_step_signature(data: bytes):
+    head = data.lstrip()[:200]
+    if b"ISO-10303-21" not in head:
+        raise HTTPException(
+            status_code=400,
+            detail="Decoded bytes do not look like a STEP Part 21 file "
+                   "(missing 'ISO-10303-21' near start). "
+                   "Most common causes: placeholder text, Power Automate expressions sent to Swagger, "
+                   "or base64 truncated."
+        )
 
 
 @app.get("/health")
@@ -141,51 +112,40 @@ def health():
     return {"status": "ok"}
 
 
+# --------------------------
+# Multipart endpoint (for Postman/clients)
+# --------------------------
 @app.post("/analyze")
-async def analyze(
-    file: UploadFile = File(...),
-    density_outer: float | None = Query(default=None, description="Outer sleeve density (kg/mm3 or g/mm3). Aluminum: 2.70e-6 kg/mm3 or 0.00270 g/mm3"),
-    density_core: float | None = Query(default=None, description="Core density (kg/mm3 or g/mm3). Aluminum: 2.70e-6 kg/mm3 or 0.00270 g/mm3"),
-    density_rubber: float | None = Query(default=None, description="Rubber density (kg/mm3 or g/mm3). Example: 1.20e-6 kg/mm3 or 0.00120 g/mm3"),
-):
-    if not processor.is_available():
-        raise HTTPException(status_code=500, detail="pythonocc-core not installed / OCCT not available")
-
+async def analyze(file: UploadFile = File(...)):
     name = (file.filename or "").lower()
     if not (name.endswith(".stp") or name.endswith(".step")):
-        raise HTTPException(status_code=400, detail="Only .stp/.step files are supported.")
+        raise HTTPException(status_code=400, detail="Only .stp/.step files supported.")
 
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
-            tmp.write(await file.read())
             tmp_path = tmp.name
+            # stream to disk
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
 
-        shape, metadata = processor._read_step_file(tmp_path)
-
-        # overall metrics (your existing processor method)
-        geometry = processor._extract_geometric_properties(shape)
-
-        d_outer = _normalize_density_to_kg_per_mm3(density_outer)
-        d_core = _normalize_density_to_kg_per_mm3(density_core)
-        d_rubber = _normalize_density_to_kg_per_mm3(density_rubber)
-
-        components = _analyze_shape_with_components(shape, d_outer, d_core, d_rubber)
+        shape = read_step_shape(tmp_path)
+        bbox = compute_bbox(shape)
+        vol_mm3, area_mm2 = compute_geom(shape)
 
         return JSONResponse({
             "file": file.filename,
-            "metadata": metadata,
-            "geometry": geometry,
-            **components,
-            "units": {
-                "length": "mm",
-                "area": "square_units (depends on STEP units)",
-                "volume": "mm3 (if STEP in mm)",
-                "density_input": "kg/mm3 or g/mm3 (auto-normalized)",
-                "weight": "kg"
-            }
+            "bounding_box_mm": bbox,
+            "solid_volume": {"mm3": vol_mm3, "m3": vol_mm3 * 1e-9},
+            "surface_area": {"mm2": area_mm2, "m2": area_mm2 * 1e-6},
+            "units": {"length": "mm", "area": "mm2/m2", "volume": "mm3/m3"}
         })
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -196,61 +156,42 @@ async def analyze(
                 pass
 
 
+# --------------------------
+# JSON base64 endpoint (Power Automate)
+# --------------------------
 @app.post("/analyze_base64")
-def analyze_base64(
-    payload: dict,
-    density_outer: float | None = Query(default=None, description="Outer sleeve density (kg/mm3 or g/mm3)."),
-    density_core: float | None = Query(default=None, description="Core density (kg/mm3 or g/mm3)."),
-    density_rubber: float | None = Query(default=None, description="Rubber density (kg/mm3 or g/mm3)."),
-):
-    if not processor.is_available():
-        raise HTTPException(status_code=500, detail="pythonocc-core not installed / OCCT not available")
-
+def analyze_base64(req: AnalyzeBase64Request):
     tmp_path = None
     try:
-        filename = payload.get("filename", "upload.step")
-        content_b64 = payload.get("content_b64")
-        if not content_b64:
-            raise ValueError("content_b64 missing")
+        if not req.filename.lower().endswith((".stp", ".step")):
+            raise HTTPException(status_code=400, detail="filename must end with .stp or .step")
 
-        data = base64.b64decode(content_b64)
+        data = decode_b64(req.content_b64)
+        assert_step_signature(data)
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
             tmp.write(data)
             tmp_path = tmp.name
 
-        shape, metadata = processor._read_step_file(tmp_path)
-        geometry = processor._extract_geometric_properties(shape)
-
-        d_outer = _normalize_density_to_kg_per_mm3(density_outer)
-        d_core = _normalize_density_to_kg_per_mm3(density_core)
-        d_rubber = _normalize_density_to_kg_per_mm3(density_rubber)
-
-        components = _analyze_shape_with_components(shape, d_outer, d_core, d_rubber)
+        shape = read_step_shape(tmp_path)  # IFSelect_RetDone must be returned for success [1](https://www.desmos.com/api/geometry)
+        bbox = compute_bbox(shape)
+        vol_mm3, area_mm2 = compute_geom(shape)
 
         return {
-            "file": filename,
-            "metadata": metadata,
-            "geometry": geometry,
-            **components,
-            "units": {
-                "length": "mm",
-                "area": "square_units (depends on STEP units)",
-                "volume": "mm3 (if STEP in mm)",
-                "density_input": "kg/mm3 or g/mm3 (auto-normalized)",
-                "weight": "kg"
-            }
+            "file": req.filename,
+            "bounding_box_mm": bbox,
+            "solid_volume": {"mm3": vol_mm3, "m3": vol_mm3 * 1e-9},
+            "surface_area": {"mm2": area_mm2, "m2": area_mm2 * 1e-6},
+            "units": {"length": "mm", "area": "mm2/m2", "volume": "mm3/m3"}
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error validating file: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-    
     finally:
-        if temp_file and os.path.exists(temp_file_path):
-            os.unlink(temp_file_path)
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass

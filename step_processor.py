@@ -6,7 +6,6 @@ Handles reading, analysis, and extraction of data from STEP files
 import logging
 from typing import Dict, Any, List, Tuple
 import os
-import math
 
 try:
     from OCC.Core.STEPControl import STEPControl_Reader
@@ -22,13 +21,8 @@ try:
         brepgprop_SurfaceProperties,
         brepgprop_LinearProperties
     )
-    
-    from typing import Dict, Any, List, Tuple, Set
-
     from OCC.Core.Bnd import Bnd_Box
-    from OCC.Core.GeomAbs import GeomAbs_Cylinder
     from OCC.Core.BRepBndLib import brepbndlib_Add
-    from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
     from OCC.Core.BRepCheck import BRepCheck_Analyzer
     from OCC.Core.TopoDS import TopoDS_Shape, TopoDS_Compound
     from OCC.Core.TopTools import TopTools_IndexedMapOfShape
@@ -149,68 +143,6 @@ class STEPProcessor:
         
         return shape, metadata
     
-    
-    def extract_cylinder_radii(self, shape: TopoDS_Shape, round_to: int = 6) -> List[float]:
-        
-        """
-        Return unique cylinder radii found on cylindrical faces of the given shape/solid.
-        Radii are returned sorted ascending.
-        """
-        radii: Set[float] = set()
-
-        exp = TopExp_Explorer(shape, TopAbs_FACE)
-        while exp.More():
-            face = exp.Current()
-            exp.Next()
-
-            adaptor = BRepAdaptor_Surface(face)
-            if adaptor.GetType() == GeomAbs_Cylinder:
-                r = float(adaptor.Cylinder().Radius())
-                radii.add(round(r, round_to))
-
-        return sorted(radii)
-
-
-    # -----------------------------
-    # 2) Extract cylinders (richer output: radius + axis)
-    # -----------------------------
-    def extract_cylinders(self, shape: TopoDS_Shape, round_to: int = 6) -> List[Dict[str, Any]]:
-        """
-        Returns cylinder features: radius + axis direction + axis location.
-        Useful if you later want coaxial grouping.
-        """
-        out: List[Dict[str, Any]] = []
-
-        exp = TopExp_Explorer(shape, TopAbs_FACE)
-        while exp.More():
-            face = exp.Current()
-            exp.Next()
-
-            adaptor = BRepAdaptor_Surface(face)
-            if adaptor.GetType() == GeomAbs_Cylinder: 
-                cyl = adaptor.Cylinder()
-                ax = cyl.Axis()
-                loc = ax.Location()
-                direc = ax.Direction()
-
-                out.append({
-                    "radius": round(float(cyl.Radius()), round_to),
-                    "axis_dir": (
-                        round(float(direc.X()), round_to),
-                        round(float(direc.Y()), round_to),
-                        round(float(direc.Z()), round_to),
-                    ),
-                    "axis_loc": (
-                        round(float(loc.X()), round_to),
-                        round(float(loc.Y()), round_to),
-                        round(float(loc.Z()), round_to),
-                    ),
-                })
-
-        return out
-
-
-
     def _extract_geometric_properties(self, shape: TopoDS_Shape) -> Dict[str, Any]:
         """
         Extract geometric properties (volume, surface area, bounding box)
@@ -259,12 +191,10 @@ class STEPProcessor:
         
         # Bounding box
         try:
-            
             bbox = Bnd_Box()
-            bbox.SetGap(0.0)
             brepbndlib_Add(shape, bbox)
+            
             xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-
             
             properties["bounding_box"] = {
                 "min": {"x": xmin, "y": ymin, "z": zmin},
@@ -281,163 +211,94 @@ class STEPProcessor:
         
         return properties
     
-    
-    def _classify_solid(self, solid: TopoDS_Shape) -> str:
+    def _extract_topology_info(self, shape: TopoDS_Shape) -> Dict[str, Any]:
+        """
+        Extract topology information (counts of solids, faces, edges, vertices)
         
+        Args:
+            shape: TopoDS_Shape to analyze
+            
+        Returns:
+            Dictionary with topology counts
         """
-        Classify solid as 'core' or 'sleeve' based on number of unique cylinder radii.
-
-        Rule (for bush-like parts):
-          - sleeve (hollow) typically has 2 radii (ID + OD)
-          - core (solid rod) typically has 1 radius
-        """
-        radii = self.extract_cylinder_radii(solid, round_to=6)
-        return "sleeve" if len(radii) >= 2 else "core"
-
-    
-    
-    def extract_od_id_thickness(self, radii: List[float]) -> Dict[str, Any]:
-        if not radii:
-            return {"OD": None, "ID": None, "thickness": None}
-
-        if len(radii) >= 2:
-            r_in = min(radii)
-            r_out = max(radii)
-            return {
-                "OD": 2 * r_out,
-                "ID": 2 * r_in,
-                "thickness": r_out - r_in
-            }
-
-        r = radii[0]
-        return {"OD": 2 * r, "ID": None, "thickness": None}
-
-
-    
-    def extract_cylinder_length(self, shape: TopoDS_Shape, round_to: int = 3) -> float:
-        """
-        Estimate cylinder length by projecting bounding box along cylinder axis.
-        Works for bush / rod type parts.
-        """
-
-        cylinders = self.extract_cylinders(shape, round_to=6)
-        if not cylinders:
-            return None
-
-        # Take dominant cylinder (largest radius)
-        cyl = max(cylinders, key=lambda c: c["radius"])
-
-        # Axis direction
-        dx, dy, dz = cyl["axis_dir"]
-        axis_len = math.sqrt(dx*dx + dy*dy + dz*dz)
-        ux, uy, uz = dx/axis_len, dy/axis_len, dz/axis_len
-
-        # Bounding box
-        bbox = Bnd_Box()
-        brepbndlib_Add(shape, bbox)
-        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-
-        corners = [
-            (xmin, ymin, zmin), (xmin, ymin, zmax),
-            (xmin, ymax, zmin), (xmin, ymax, zmax),
-            (xmax, ymin, zmin), (xmax, ymin, zmax),
-            (xmax, ymax, zmin), (xmax, ymax, zmax),
-        ]
-
-        projections = [
-            x*ux + y*uy + z*uz for x, y, z in corners
-        ]
-
-        length = max(projections) - min(projections)
-        return round(length, round_to)
-
-    
-    def extract_weight(self, shape: TopoDS_Shape, density: float, round_to: int = 3) -> float:
-        """
-        Compute weight from STEP volume and provided density.
-
-        density:
-            kg/mm3  → if STEP is in mm
-            kg/m3   → if STEP is in meters
-        """
-
-        props = GProp_GProps()
-        brepgprop_VolumeProperties(shape, props)
-        volume = props.Mass()
-
-        weight = volume * density
-        return round(weight, round_to)
-
-    
-    def extract_length_and_weight(
-        self,
-        file_path: str,
-        density: float
-    ) -> Dict[str, Any]:
-
-        shape, _ = self._read_step_file(file_path)
-
-        return {
-            "length": self.extract_cylinder_length(shape),
-            "weight": self.extract_weight(shape, density),
+        topology = {
+            "solids": 0,
+            "compounds": 0,
+            "shells": 0,
+            "faces": 0,
+            "edges": 0,
+            "vertices": 0
         }
-
-    
-    
-
-
+        
+        # Count topology elements
+        explorer = TopologyExplorer(shape)
+        
+        topology["solids"] = explorer.number_of_solids()
+        topology["compounds"] = explorer.number_of_compounds()
+        topology["shells"] = explorer.number_of_shells()
+        topology["faces"] = explorer.number_of_faces()
+        topology["edges"] = explorer.number_of_edges()
+        topology["vertices"] = explorer.number_of_vertices()
+        
+        # Additional details
+        topology["details"] = {
+            "has_free_edges": len(list(explorer.edges())) != topology["edges"],
+            "shape_type": shape.ShapeType()
+        }
+        
+        return topology
     
     def _validate_shape(self, shape: TopoDS_Shape) -> Dict[str, Any]:
+        """
+        Validate shape quality and check for issues
+        
+        Args:
+            shape: TopoDS_Shape to validate
+            
+        Returns:
+            Dictionary with validation results
+        """
         validation = {
             "is_valid": False,
             "is_done": False,
             "issues": []
         }
-
+        
         try:
             analyzer = BRepCheck_Analyzer(shape)
             validation["is_valid"] = analyzer.IsValid()
-
+            
             if not validation["is_valid"]:
+                # The shape has issues
                 validation["issues"].append("Shape contains geometric or topological errors")
-
+            
             validation["is_done"] = True
-
+            
         except Exception as e:
             logger.error(f"Validation error: {e}")
             validation["issues"].append(f"Validation failed: {str(e)}")
-
-        # ---- Per-solid validation ----
-        validation["per_solid"] = []
+        
+        # Additional quality checks
         try:
             explorer = TopologyExplorer(shape)
-            for solid in explorer.solids():
-                role = self._classify_solid(solid)
-                solid_analyzer = BRepCheck_Analyzer(solid)
-
-                validation["per_solid"].append({
-                    "role": role,
-                    "is_valid": solid_analyzer.IsValid()
-                })
-        except Exception as e:
-            logger.warning(f"Per-solid validation error: {e}")
-
-        # ---- Degenerate edges ----
-        try:
-            explorer = TopologyExplorer(shape)
-            degenerate_count = sum(1 for e in explorer.edges() if e.Degenerated())
-
+            
+            # Check for degenerate edges
+            degenerate_count = 0
+            for edge in explorer.edges():
+                if edge.Degenerated():
+                    degenerate_count += 1
+            
             if degenerate_count > 0:
                 validation["issues"].append(f"Found {degenerate_count} degenerate edges")
-
+            
             validation["quality_metrics"] = {
                 "degenerate_edges": degenerate_count,
                 "total_edges": explorer.number_of_edges()
             }
-
+            
         except Exception as e:
             logger.warning(f"Quality check error: {e}")
-
+        
         return validation
     
     def _extract_assembly_structure(self, file_path: str) -> Dict[str, Any]:
@@ -450,15 +311,12 @@ class STEPProcessor:
         Returns:
             Dictionary with assembly information
         """
-        
         assembly_info = {
             "is_assembly": False,
-            "part_count": 0,
             "parts": [],
             "layers": [],
             "colors": []
         }
-
         
         try:
             # Create XCAF document
