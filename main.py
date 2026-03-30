@@ -3,112 +3,235 @@ from fastapi.responses import JSONResponse
 import tempfile
 import os
 import base64
-from typing import Optional, Dict, Any, List
+from typing import List, Dict, Any, Tuple, Optional, Set
 
-# ✅ import your processor file
-from step_processor import STEPProcessor
+# ---- OpenCascade via OCP (cadquery-ocp) ----
+from OCP.STEPControl import STEPControl_Reader
+from OCP.IFSelect import IFSelect_RetDone
 
-# OCCT props (volume) for per-solid volume
-from OCC.Core.GProp import GProp_GProps
-from OCC.Core.BRepGProp import brepgprop_VolumeProperties
-from OCC.Extend.TopologyUtils import TopologyExplorer
+from OCP.Bnd import Bnd_Box
+from OCP.BRepBndLib import BRepBndLib            # static methods have _s suffix in OCP
+from OCP.BRepGProp import BRepGProp              # static methods have _s suffix in OCP
+from OCP.GProp import GProp_GProps
 
-app = FastAPI(title="STEP Geometry API (pythonocc)", version="1.0")
+from OCP.TopExp import TopExp_Explorer
+# ✅ CHANGED: add COMPSOLID + SHELL
+from OCP.TopAbs import TopAbs_SOLID, TopAbs_COMPSOLID, TopAbs_SHELL, TopAbs_FACE
+
+from OCP.BRepAdaptor import BRepAdaptor_Surface
+from OCP.GeomAbs import GeomAbs_Cylinder
+
+app = FastAPI(title="STEP Geometry API", version="2.1")
 
 processor = STEPProcessor()
 
 
-def _normalize_density_to_kg_per_mm3(d: Optional[float]) -> Optional[float]:
-    """
-    Accept density in:
-      - kg/mm3  (steel: 7.85e-6, aluminum: 2.70e-6)
-      - OR g/mm3 (common user input: aluminum 0.00270, steel 0.00785)
-    Rule: if d > 1e-4 assume g/mm3 -> convert to kg/mm3 by /1000
-    """
-    if d is None:
-        return None
-    d = float(d)
-    if d > 1e-4:
-        return d / 1000.0
-    return d
+def compute_bbox(shape) -> Dict[str, float]:
+    """Compute axis-aligned bounding box in mm using OCCT."""
+    bbox = Bnd_Box()
+    bbox.SetGap(0.0)  # avoid tolerance enlargement
+    BRepBndLib.Add_s(shape, bbox, True)  # useTriangulation=True
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+    return {
+        "xmin": float(xmin), "ymin": float(ymin), "zmin": float(zmin),
+        "xmax": float(xmax), "ymax": float(ymax), "zmax": float(zmax),
+        "length_mm": float(xmax - xmin),
+        "width_mm":  float(ymax - ymin),
+        "height_mm": float(zmax - zmin)
+    }
 
 
-def _solid_volume_mm3(solid) -> float:
+def compute_geom(shape) -> Tuple[float, float]:
+    """Compute volume (mm3) and area (mm2) via BRepGProp."""
+    vol_props = GProp_GProps()
+    area_props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shape, vol_props)     # props.Mass() = volume
+    BRepGProp.SurfaceProperties_s(shape, area_props)   # props.Mass() = area
+    return float(vol_props.Mass()), float(area_props.Mass())
+
+
+# --------------------------
+# Topology iteration helpers
+# --------------------------
+def iter_faces(shape):
+    exp = TopExp_Explorer(shape, TopAbs_FACE)
+    while exp.More():
+        yield exp.Current()
+        exp.Next()
+
+
+# ✅ ADDED: robust body iterator (SOLID -> COMPSOLID -> SHELL -> fallback to shape)
+def iter_bodies(shape):
+    """
+    Robust body iterator:
+    - SOLID first
+    - then COMPSOLID
+    - then SHELL
+    - else whole shape
+    """
+    solids: List[Any] = []
+    exp = TopExp_Explorer(shape, TopAbs_SOLID)
+    while exp.More():
+        solids.append(exp.Current())
+        exp.Next()
+    if solids:
+        for s in solids:
+            yield ("solid", s)
+        return
+
+    comps: List[Any] = []
+    exp = TopExp_Explorer(shape, TopAbs_COMPSOLID)
+    while exp.More():
+        comps.append(exp.Current())
+        exp.Next()
+    if comps:
+        for c in comps:
+            yield ("compsolid", c)
+        return
+
+    shells: List[Any] = []
+    exp = TopExp_Explorer(shape, TopAbs_SHELL)
+    while exp.More():
+        shells.append(exp.Current())
+        exp.Next()
+    if shells:
+        for sh in shells:
+            yield ("shell", sh)
+        return
+
+    yield ("shape", shape)
+
+
+# ✅ ADDED: debug topology counts (so you see why core/sleeve were null)
+def count_topology(shape) -> Dict[str, int]:
+    counts = {"solids": 0, "compsolids": 0, "shells": 0, "faces": 0}
+
+    exp = TopExp_Explorer(shape, TopAbs_SOLID)
+    while exp.More():
+        counts["solids"] += 1
+        exp.Next()
+
+    exp = TopExp_Explorer(shape, TopAbs_COMPSOLID)
+    while exp.More():
+        counts["compsolids"] += 1
+        exp.Next()
+
+    exp = TopExp_Explorer(shape, TopAbs_SHELL)
+    while exp.More():
+        counts["shells"] += 1
+        exp.Next()
+
+    exp = TopExp_Explorer(shape, TopAbs_FACE)
+    while exp.More():
+        counts["faces"] += 1
+        exp.Next()
+
+    return counts
+
+
+# --------------------------
+# Core/Sleeve feature extraction
+# --------------------------
+def extract_cylinder_radii(shape, round_to: int = 6) -> List[float]:
+    """Return sorted unique radii from cylindrical faces."""
+    radii: Set[float] = set()
+    for face in iter_faces(shape):
+        adaptor = BRepAdaptor_Surface(face)
+        if adaptor.GetType() == GeomAbs_Cylinder:
+            r = float(adaptor.Cylinder().Radius())
+            radii.add(round(r, round_to))
+    return sorted(radii)
+
+
+def classify_solid(solid) -> str:
+    """
+    Sleeve typically has 2 cylinder radii (ID+OD),
+    Core typically has 1 radius (solid rod) or sometimes 2 if hollow.
+    Rule: >=2 radii => sleeve else core.
+    """
+    radii = extract_cylinder_radii(solid, round_to=6)
+    return "sleeve" if len(radii) >= 2 else "core"
+
+
+def od_id_thickness_from_radii(radii: List[float]) -> Dict[str, Optional[float]]:
+    if not radii:
+        return {"OD_mm": None, "ID_mm": None, "thickness_mm": None}
+    if len(radii) >= 2:
+        r_in = min(radii)
+        r_out = max(radii)
+        return {
+            "OD_mm": float(2.0 * r_out),
+            "ID_mm": float(2.0 * r_in),
+            "thickness_mm": float(r_out - r_in)
+        }
+    r = radii[0]
+    return {"OD_mm": float(2.0 * r), "ID_mm": None, "thickness_mm": None}
+
+
+def solid_length_mm(solid) -> float:
+    """Use bbox max dimension as length estimate (works well for bush parts)."""
+    bb = compute_bbox(solid)
+    return float(max(bb["length_mm"], bb["width_mm"], bb["height_mm"]))
+
+
+def solid_volume_mm3(solid) -> float:
     props = GProp_GProps()
     brepgprop_VolumeProperties(solid, props)
     return float(props.Mass())
 
 
-def _assign_outer_core_rubber(per_solid: List[Dict[str, Any]]) -> Dict[str, Any]:
+# ✅ CHANGED: uses iter_bodies() + handles shell/shape (volume may be unavailable)
+def compute_core_sleeve(shape,
+                        density_core_kg_per_mm3: Optional[float] = None,
+                        density_sleeve_kg_per_mm3: Optional[float] = None) -> Dict[str, Any]:
     """
-    Deterministic 3-part assignment:
-      1) outer_sleeve: candidate with (>=2 radii) and max OD
-      2) core: remaining with smallest OD among those with OD
-      3) rubber: remaining with max volume
-    """
-    # sleeve candidates: >=2 cylinder radii and OD available
-    sleeve_candidates = [s for s in per_solid if s.get("OD_mm") is not None and len(s.get("cylinder_radii_mm", [])) >= 2]
-    outer = max(sleeve_candidates, key=lambda x: x["OD_mm"]) if sleeve_candidates else None
-
-    remaining = [s for s in per_solid if s is not outer]
-
-    # core candidates: OD available
-    core_candidates = [s for s in remaining if s.get("OD_mm") is not None]
-    core = min(core_candidates, key=lambda x: x["OD_mm"]) if core_candidates else None
-
-    remaining2 = [s for s in remaining if s is not core]
-
-    # rubber: max volume among remaining
-    rubber = max(remaining2, key=lambda x: x.get("volume_mm3", -1)) if remaining2 else None
-
-    extras = [s for s in per_solid if s not in (outer, core, rubber)]
-
-    return {"outer_sleeve": outer, "core": core, "rubber": rubber, "extra_solids": extras}
-
-
-def _analyze_shape_with_components(shape, d_outer, d_core, d_rubber) -> Dict[str, Any]:
-    """
-    Builds per-solid + components mapping with length & weight.
+    Returns:
+      { "core": {...}, "sleeve": {...}, "extra_solids": [...] }
+    Works even when STEP has no TopAbs_SOLID (e.g. only shells/compounds).
     """
     topo = TopologyExplorer(shape)
     solids = list(topo.solids())
 
     per_solid: List[Dict[str, Any]] = []
 
-    for idx, solid in enumerate(solids, start=1):
-        radii = processor.extract_cylinder_radii(solid, round_to=6)
-        dims = processor.extract_od_id_thickness(radii)  # returns OD, ID, thickness (in same units as STEP)
-        length = processor.extract_cylinder_length(solid)  # ✅ you added this
-        vol_mm3 = _solid_volume_mm3(solid)
+    for body_type, body in iter_bodies(shape):
+        role = classify_solid(body)
+        radii = extract_cylinder_radii(body, round_to=6)
+        dims = od_id_thickness_from_radii(radii)
+        length = solid_length_mm(body)
 
-        per_solid.append({
-            "index": idx,
-            "cylinder_radii_mm": radii,
-            "OD_mm": float(dims["OD"]) if dims.get("OD") is not None else None,
-            "ID_mm": float(dims["ID"]) if dims.get("ID") is not None else None,
-            "thickness_mm": float(dims["thickness"]) if dims.get("thickness") is not None else None,
+        # volume is reliable for solid/compsolid; shell/shape may be open => skip volume
+        vol: Optional[float] = None
+        if body_type in ("solid", "compsolid"):
+            vol = solid_volume_mm3(body)
+
+        density = density_core_kg_per_mm3 if role == "core" else density_sleeve_kg_per_mm3
+        weight_kg = (vol * density) if (vol is not None and density is not None) else None
+
+        payload = {
+            "role": role,
+            "body_type": body_type,          # "solid" | "compsolid" | "shell" | "shape"
             "length_mm": length,
-            "volume_mm3": vol_mm3
-        })
+            **dims,
+            "cylinder_radii_mm": radii,      # debug/trace
+            "volume": ({"mm3": vol, "m3": vol * 1e-9} if vol is not None else None),
+            "weight_kg": weight_kg,
+            "weight_requires_density": density is None,
+            "volume_available": vol is not None
+        }
 
-    # Assign 3 components
-    comp = _assign_outer_core_rubber(per_solid)
+        if role not in per_role:
+            per_role[role] = payload
+        else:
+            # keep the one with larger volume if volume is available; else keep first
+            existing_vol = per_role[role]["volume"]["mm3"] if per_role[role]["volume"] else -1
+            this_vol = vol if vol is not None else -1
 
-    # Attach weight using per-component density (kg/mm3)
-    def attach_weight(part: Optional[Dict[str, Any]], dens: Optional[float]) -> Optional[Dict[str, Any]]:
-        if part is None:
-            return None
-        if dens is None:
-            part["weight_kg"] = None
-            part["weight_requires_density"] = True
-            return part
-        part["weight_kg"] = float(part["volume_mm3"]) * dens
-        part["weight_requires_density"] = False
-        return part
-
-    comp["outer_sleeve"] = attach_weight(comp["outer_sleeve"], d_outer)
-    comp["core"] = attach_weight(comp["core"], d_core)
-    comp["rubber"] = attach_weight(comp["rubber"], d_rubber)
+            if this_vol > existing_vol:
+                extra_solids.append(per_role[role])
+                per_role[role] = payload
+            else:
+                extra_solids.append(payload)
 
     return {
         "topology": {
@@ -147,22 +270,28 @@ async def analyze(
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        shape, metadata = processor._read_step_file(tmp_path)
+        shape = read_step_shape(tmp_path)
+        bbox = compute_bbox(shape)
+        vol_mm3, area_mm2 = compute_geom(shape)
 
-        # overall metrics (your existing processor method)
-        geometry = processor._extract_geometric_properties(shape)
+        # ✅ ADDED: diagnostics
+        topo_counts = count_topology(shape)
 
-        d_outer = _normalize_density_to_kg_per_mm3(density_outer)
-        d_core = _normalize_density_to_kg_per_mm3(density_core)
-        d_rubber = _normalize_density_to_kg_per_mm3(density_rubber)
-
-        components = _analyze_shape_with_components(shape, d_outer, d_core, d_rubber)
+        core_sleeve = compute_core_sleeve(
+            shape,
+            density_core_kg_per_mm3=density_core_kg_per_mm3,
+            density_sleeve_kg_per_mm3=density_sleeve_kg_per_mm3
+        )
 
         return JSONResponse({
             "file": file.filename,
-            "metadata": metadata,
-            "geometry": geometry,
-            **components,
+            "topology_counts": topo_counts,  # ✅ ADDED
+            "bounding_box_mm": bbox,
+            "solid_volume": {"mm3": vol_mm3, "m3": vol_mm3 * 1e-9},
+            "surface_area": {"mm2": area_mm2, "m2": area_mm2 * 1e-6},
+            "core": core_sleeve["core"],
+            "sleeve": core_sleeve["sleeve"],
+            "extra_solids": core_sleeve["extra_solids"],
             "units": {
                 "length": "mm",
                 "area": "square_units (depends on STEP units)",
@@ -205,20 +334,28 @@ def analyze_base64(
             tmp.write(data)
             tmp_path = tmp.name
 
-        shape, metadata = processor._read_step_file(tmp_path)
-        geometry = processor._extract_geometric_properties(shape)
+        shape = read_step_shape(tmp_path)
+        bbox = compute_bbox(shape)
+        vol_mm3, area_mm2 = compute_geom(shape)
 
-        d_outer = _normalize_density_to_kg_per_mm3(density_outer)
-        d_core = _normalize_density_to_kg_per_mm3(density_core)
-        d_rubber = _normalize_density_to_kg_per_mm3(density_rubber)
+        # ✅ ADDED: diagnostics
+        topo_counts = count_topology(shape)
 
-        components = _analyze_shape_with_components(shape, d_outer, d_core, d_rubber)
+        core_sleeve = compute_core_sleeve(
+            shape,
+            density_core_kg_per_mm3=density_core_kg_per_mm3,
+            density_sleeve_kg_per_mm3=density_sleeve_kg_per_mm3
+        )
 
         return {
             "file": filename,
-            "metadata": metadata,
-            "geometry": geometry,
-            **components,
+            "topology_counts": topo_counts,  # ✅ ADDED
+            "bounding_box_mm": bbox,
+            "solid_volume": {"mm3": vol_mm3, "m3": vol_mm3 * 1e-9},
+            "surface_area": {"mm2": area_mm2, "m2": area_mm2 * 1e-6},
+            "core": core_sleeve["core"],
+            "sleeve": core_sleeve["sleeve"],
+            "extra_solids": core_sleeve["extra_solids"],
             "units": {
                 "length": "mm",
                 "area": "square_units (depends on STEP units)",

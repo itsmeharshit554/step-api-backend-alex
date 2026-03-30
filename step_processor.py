@@ -151,22 +151,22 @@ class STEPProcessor:
     
     
     def extract_cylinder_radii(self, shape: TopoDS_Shape, round_to: int = 6) -> List[float]:
-        
-        """
-        Return unique cylinder radii found on cylindrical faces of the given shape/solid.
-        Radii are returned sorted ascending.
-        """
+
         radii: Set[float] = set()
 
         exp = TopExp_Explorer(shape, TopAbs_FACE)
+
         while exp.More():
             face = exp.Current()
             exp.Next()
 
-            adaptor = BRepAdaptor_Surface(face)
-            if adaptor.GetType() == GeomAbs_Cylinder:
-                r = float(adaptor.Cylinder().Radius())
-                radii.add(round(r, round_to))
+            try:
+                adaptor = BRepAdaptor_Surface(face)
+                if adaptor.GetType() == GeomAbs_Cylinder:
+                    r = float(adaptor.Cylinder().Radius())
+                    radii.add(round(r, round_to))
+            except:
+                continue
 
         return sorted(radii)
 
@@ -315,26 +315,31 @@ class STEPProcessor:
 
     
     def extract_cylinder_length(self, shape: TopoDS_Shape, round_to: int = 3) -> float:
-        """
-        Estimate cylinder length by projecting bounding box along cylinder axis.
-        Works for bush / rod type parts.
-        """
 
         cylinders = self.extract_cylinders(shape, round_to=6)
-        if not cylinders:
-            return None
 
-        # Take dominant cylinder (largest radius)
+        # 🔥 FALLBACK (IMPORTANT)
+        if not cylinders:
+            bbox = Bnd_Box()
+            brepbndlib_Add(shape, bbox)
+            xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+
+            dx = xmax - xmin
+            dy = ymax - ymin
+            dz = zmax - zmin
+
+            return round(max(dx, dy, dz), round_to)
+
         cyl = max(cylinders, key=lambda c: c["radius"])
 
-        # Axis direction
         dx, dy, dz = cyl["axis_dir"]
-        axis_len = math.sqrt(dx*dx + dy*dy + dz*dz)
-        ux, uy, uz = dx/axis_len, dy/axis_len, dz/axis_len
+        mag = math.sqrt(dx*dx + dy*dy + dz*dz)
 
-        # Bounding box
+        ux, uy, uz = dx/mag, dy/mag, dz/mag
+
         bbox = Bnd_Box()
         brepbndlib_Add(shape, bbox)
+
         xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
 
         corners = [
@@ -344,9 +349,7 @@ class STEPProcessor:
             (xmax, ymax, zmin), (xmax, ymax, zmax),
         ]
 
-        projections = [
-            x*ux + y*uy + z*uz for x, y, z in corners
-        ]
+        projections = [x*ux + y*uy + z*uz for x, y, z in corners]
 
         length = max(projections) - min(projections)
         return round(length, round_to)
@@ -384,28 +387,20 @@ class STEPProcessor:
 
     
     def _extract_topology_info(self, shape: TopoDS_Shape) -> Dict[str, Any]:
-        
-        """
-        Extract topology information (counts of solids, faces, edges, vertices)
 
-        Args:
-            shape: TopoDS_Shape to analyze
-
-        Returns:
-            Dictionary with topology counts
-        """
         topology: Dict[str, Any] = {
             "solids": 0,
             "compounds": 0,
             "shells": 0,
             "faces": 0,
             "edges": 0,
-            "vertices": 0
+            "vertices": 0,
+            "per_solid": []
         }
 
-        # Count topology elements (GLOBAL)
         explorer = TopologyExplorer(shape)
 
+        # Global counts
         topology["solids"] = explorer.number_of_solids()
         topology["compounds"] = explorer.number_of_compounds()
         topology["shells"] = explorer.number_of_shells()
@@ -413,28 +408,34 @@ class STEPProcessor:
         topology["edges"] = explorer.number_of_edges()
         topology["vertices"] = explorer.number_of_vertices()
 
-        
-        radii = self.extract_cylinder_radii(solid, round_to=6)
-        dims = self.extract_od_id_thickness(radii)
-
-        # NEW: per-solid topology + role
-        topology["per_solid"] = []
+        # ✅ PER SOLID (FIXED)
         for solid in explorer.solids():
+
             solid_explorer = TopologyExplorer(solid)
-            role = self._classify_solid(solid)
 
-            
-        topology["per_solid"].append({
-            "role": role,
-            "faces": solid_explorer.number_of_faces(),
-            "edges": solid_explorer.number_of_edges(),
-            "vertices": solid_explorer.number_of_vertices(),
-            "cylinder_radii": radii,
-            "dimensions_hint": dims
-        })
+            radii = self.extract_cylinder_radii(solid, round_to=6)
+            dims = self.extract_od_id_thickness(radii)
 
+            # 🔥 LENGTH FALLBACK
+            length = self.extract_cylinder_length(solid)
+            if length is None:
+                bbox = Bnd_Box()
+                brepbndlib_Add(solid, bbox)
+                xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+                length = max(xmax - xmin, ymax - ymin, zmax - zmin)
 
-        # Additional details (same as your logic)
+            topology["per_solid"].append({
+                "role": self._classify_solid(solid),
+                "faces": solid_explorer.number_of_faces(),
+                "edges": solid_explorer.number_of_edges(),
+                "vertices": solid_explorer.number_of_vertices(),
+                "cylinder_radii": radii,
+                "OD": dims["OD"],
+                "ID": dims["ID"],
+                "thickness": dims["thickness"],
+                "length": round(length, 3) if length else None
+            })
+
         topology["details"] = {
             "has_free_edges": len(list(explorer.edges())) != topology["edges"],
             "shape_type": shape.ShapeType()
