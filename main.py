@@ -67,43 +67,87 @@ def _assign_outer_core_rubber(per_solid: List[Dict[str, Any]]) -> Dict[str, Any]
 
 
 def _analyze_shape_with_components(shape, d_outer, d_core, d_rubber) -> Dict[str, Any]:
-    """
-    Builds per-solid + components mapping with length & weight.
-    """
+
     topo = TopologyExplorer(shape)
     solids = list(topo.solids())
 
     per_solid: List[Dict[str, Any]] = []
 
     for idx, solid in enumerate(solids, start=1):
-        radii = processor.extract_cylinder_radii(solid, round_to=6)
-        dims = processor.extract_od_id_thickness(radii)  # returns OD, ID, thickness (in same units as STEP)
-        length = processor.extract_cylinder_length(solid)  # ✅ you added this
-        vol_mm3 = _solid_volume_mm3(solid)
+
+        try:
+            # ---- CYLINDER DETECTION ----
+            radii = processor.extract_cylinder_radii(solid, round_to=6)
+        except Exception:
+            radii = []
+
+        # ---- DIMENSIONS ----
+        try:
+            if radii:
+                dims = processor.extract_od_id_thickness(radii)
+                length = processor.extract_cylinder_length(solid)
+            else:
+                # 🔥 FALLBACK (VERY IMPORTANT)
+                bbox = processor._extract_geometric_properties(solid).get("bounding_box")
+
+                if bbox:
+                    dx = bbox["dimensions"]["length_x"]
+                    dy = bbox["dimensions"]["length_y"]
+                    dz = bbox["dimensions"]["length_z"]
+
+                    dims_sorted = sorted([dx, dy, dz])
+
+                    length = dims_sorted[2]
+                    dims = {
+                        "OD": dims_sorted[1],
+                        "ID": None,
+                        "thickness": None
+                    }
+                else:
+                    length = None
+                    dims = {"OD": None, "ID": None, "thickness": None}
+
+        except Exception:
+            length = None
+            dims = {"OD": None, "ID": None, "thickness": None}
+
+        # ---- VOLUME ----
+        try:
+            vol_mm3 = _solid_volume_mm3(solid)
+        except Exception:
+            vol_mm3 = None
 
         per_solid.append({
             "index": idx,
             "cylinder_radii_mm": radii,
-            "OD_mm": float(dims["OD"]) if dims.get("OD") is not None else None,
-            "ID_mm": float(dims["ID"]) if dims.get("ID") is not None else None,
-            "thickness_mm": float(dims["thickness"]) if dims.get("thickness") is not None else None,
-            "length_mm": length,
+            "OD_mm": float(dims["OD"]) if dims.get("OD") else None,
+            "ID_mm": float(dims["ID"]) if dims.get("ID") else None,
+            "thickness_mm": float(dims["thickness"]) if dims.get("thickness") else None,
+            "length_mm": round(length, 3) if length else None,
             "volume_mm3": vol_mm3
         })
 
-    # Assign 3 components
+    # ---- COMPONENT ASSIGNMENT ----
     comp = _assign_outer_core_rubber(per_solid)
 
-    # Attach weight using per-component density (kg/mm3)
-    def attach_weight(part: Optional[Dict[str, Any]], dens: Optional[float]) -> Optional[Dict[str, Any]]:
+    # ---- WEIGHT ----
+    def attach_weight(part: Optional[Dict[str, Any]], dens: Optional[float]):
+
         if part is None:
             return None
-        if dens is None:
+
+        if dens is None or part.get("volume_mm3") is None:
             part["weight_kg"] = None
             part["weight_requires_density"] = True
             return part
-        part["weight_kg"] = float(part["volume_mm3"]) * dens
-        part["weight_requires_density"] = False
+
+        try:
+            part["weight_kg"] = float(part["volume_mm3"]) * dens
+            part["weight_requires_density"] = False
+        except Exception:
+            part["weight_kg"] = None
+            part["weight_requires_density"] = True
+
         return part
 
     comp["outer_sleeve"] = attach_weight(comp["outer_sleeve"], d_outer)
@@ -120,66 +164,6 @@ def _analyze_shape_with_components(shape, d_outer, d_core, d_rubber) -> Dict[str
         "per_solid": per_solid,
         "components": comp
     }
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.post("/analyze")
-async def analyze(
-    file: UploadFile = File(...),
-    density_outer: float | None = Query(default=None, description="Outer sleeve density (kg/mm3 or g/mm3). Aluminum: 2.70e-6 kg/mm3 or 0.00270 g/mm3"),
-    density_core: float | None = Query(default=None, description="Core density (kg/mm3 or g/mm3). Aluminum: 2.70e-6 kg/mm3 or 0.00270 g/mm3"),
-    density_rubber: float | None = Query(default=None, description="Rubber density (kg/mm3 or g/mm3). Example: 1.20e-6 kg/mm3 or 0.00120 g/mm3"),
-):
-    if not processor.is_available():
-        raise HTTPException(status_code=500, detail="pythonocc-core not installed / OCCT not available")
-
-    name = (file.filename or "").lower()
-    if not (name.endswith(".stp") or name.endswith(".step")):
-        raise HTTPException(status_code=400, detail="Only .stp/.step files are supported.")
-
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
-
-        shape, metadata = processor._read_step_file(tmp_path)
-
-        # overall metrics (your existing processor method)
-        geometry = processor._extract_geometric_properties(shape)
-
-        d_outer = _normalize_density_to_kg_per_mm3(density_outer)
-        d_core = _normalize_density_to_kg_per_mm3(density_core)
-        d_rubber = _normalize_density_to_kg_per_mm3(density_rubber)
-
-        components = _analyze_shape_with_components(shape, d_outer, d_core, d_rubber)
-
-        return JSONResponse({
-            "file": file.filename,
-            "metadata": metadata,
-            "geometry": geometry,
-            **components,
-            "units": {
-                "length": "mm",
-                "area": "square_units (depends on STEP units)",
-                "volume": "mm3 (if STEP in mm)",
-                "density_input": "kg/mm3 or g/mm3 (auto-normalized)",
-                "weight": "kg"
-            }
-        })
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
 
 
 @app.post("/analyze_base64")
